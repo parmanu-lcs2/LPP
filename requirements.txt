@@ -1,0 +1,6 @@
+tiktoken
+triton
+flash-attn
+git+https://github.com/huggingface/transformers
+datasets
+torch
