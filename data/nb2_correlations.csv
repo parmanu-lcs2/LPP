@@ -1,0 +1,5 @@
+x,y,rho,p,n,note
+EntropyFloor,claude_reliability,-0.731,0.04,8,lower floor -> more reliable (expect -)
+EntropyFloor,claude_halluc_rate,0.719,0.045,8,lower floor -> less hallucination (expect +)
+AR,claude_AR_acc,0.928,0.001,8,"automatic AR vs Claude AR (validation, expect +)"
+EntropyFloor,claude_AR_acc,-0.731,0.04,8,lower floor -> better AR (expect -)

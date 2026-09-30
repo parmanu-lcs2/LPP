@@ -1,0 +1,12 @@
+LPP_metric,external_target,n,spearman_rho,p,CI95_low,CI95_high
+EntropyFloor,TQA_acc,8,-0.802,0.017,-1.0,-0.103
+PR,dyck_f1,8,-0.619,0.102,-1.0,0.266
+PR,dyck_em,8,-0.571,0.139,-1.0,0.317
+PR,listfn_em,8,-0.347,0.399,-0.912,0.528
+ER,dyck_f1,8,-0.69,0.058,-1.0,0.215
+ER,dyck_em,8,-0.69,0.058,-1.0,0.151
+ER,listfn_em,8,-0.299,0.471,-0.917,0.611
+PR_robust,dyck_f1,8,-0.81,0.015,-1.0,-0.136
+PR_robust,listfn_em,8,-0.216,0.608,-0.892,0.73
+ER_robust,dyck_f1,8,-0.5,0.207,-1.0,0.452
+ER_robust,listfn_em,8,0.024,0.955,-0.842,0.905

@@ -1,4 +1,18 @@
-# eval_ar_fewshot_strict_retry.py
+"""
+Few-shot evaluation on the Ambiguous Reasoning (AR) task.
+
+Each item presents an ambiguous prefix, two candidate senses (A/B) and a disambiguating hint.
+The model must output `ambiguous_status=<AMBIGUOUS|NOT_AMBIGUOUS>; answer=<A|B>`.
+
+Reported metrics (per model):
+  accuracy          : answer-choice accuracy (A/B) -- the AR score reported in the paper
+  ambiguity_acc     : fraction of items labelled AMBIGUOUS (all gold labels are AMBIGUOUS)
+  combined          : mean of accuracy and ambiguity_acc
+  overconfidence    : fraction labelled NOT_AMBIGUOUS
+
+Few-shot context: `--shots` answer-format demonstrations ("Example -> ambiguous_status=...;
+answer=...") sampled from the test file with `--seed`.
+"""
 import argparse, os, json, random, re
 import pandas as pd
 import torch
@@ -115,11 +129,8 @@ def render_prompts(tokenizer, rows, optA_list, optB_list, prefix_list, hint_list
         if use_template:
             prompt = tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
         else:
-            prompt = (
-                f"[SYSTEM]\n{SYS_MSG}\n\n"
-                f"{fewshot_text+'\n' if fewshot_text else ''}"
-                f"{msgs[1]['content']}"
-            )
+            # msgs[1] already contains the few-shot block
+            prompt = f"[SYSTEM]\n{SYS_MSG}\n\n{msgs[1]['content']}"
         prompts.append(prompt)
     return prompts
 
@@ -221,8 +232,8 @@ def main():
             ans_pred.append(ans_s)
 
         accuracy = sum(1 for a, g in zip(ans_pred, ans_gold) if a == g) / len(ans_gold)
+        amb_acc = sum(1 for a, g in zip(amb_pred, amb_gold) if a == g) / len(amb_gold)
         overconf = sum(1 for a in amb_pred if a == "NOT_AMBIGUOUS") / len(amb_pred)
-        underconf = 0.0
 
         safe = mid.replace("/", "__")
         pd.DataFrame({
@@ -239,11 +250,16 @@ def main():
         pd.DataFrame([{
             "model_id": mid,
             "accuracy": accuracy,
+            "ambiguity_acc": amb_acc,
+            "combined": (accuracy + amb_acc) / 2,
             "overconfidence": overconf,
-            "underconfidence": underconf
         }]).to_csv(os.path.join(args.per_model_out, f"ar_metrics__{safe}.csv"), index=False)
 
-        print(f"[{mid}] AR: ACC={accuracy:.3f}  overconf={overconf:.3f}  underconf={underconf:.3f}")
+        print(f"[{mid}] AR: ACC={accuracy:.3f}  amb_acc={amb_acc:.3f}  overconf={overconf:.3f}")
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main()

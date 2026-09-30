@@ -1,333 +1,223 @@
-import argparse, json
+"""
+Latent Performance Profiling (LPP): intrinsic metrics for causal LLMs.
+
+For every model, calibration corpus, context length and prefix length, this script computes
+  * mean_next_token_entropy : next-token entropy at the last prefix position, normalised by log|V|
+                              and averaged over prompts (computed from raw logits, no temperature);
+  * participation_ratio     : (sum lambda)^2 / sum lambda^2 of the token-level hidden-state covariance;
+  * effective_rank          : exp(Shannon entropy of the normalised eigenvalue spectrum).
+PR and ER are divided by the number of non-zero-capacity eigenvalues, i.e. min(#tokens, hidden size),
+exactly as in the code used for the paper.
+
+Hidden states from all non-padding tokens of all prompts are pooled into a single covariance
+(capped at --token_cap randomly selected tokens). By default the last layer is used; pass
+--layers all to reproduce the layer-wise analysis.
+
+Model-level LPP profiles (min entropy, max PR, max ER over prefix lengths) are produced by aggregate.py.
+
+Example (paper setting, Alpaca, context length 200):
+    python lpp.py --models Qwen/Qwen2.5-7B-Instruct --dataset alpaca \
+                  --context_lengths 200 --sample_size 100 --out_csv results/lpp_alpaca.csv
+"""
+import argparse
+import math
+import os
+import random
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
-import math
-
 from datasets import load_dataset
 from scipy.linalg import svd
-from numpy.linalg import slogdet
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+# Calibration corpora used in the paper.
+DATASETS = {
+    "alpaca": dict(path="tatsu-lab/alpaca", name=None, split="train[:5%]"),
+    "dolly": dict(path="databricks/databricks-dolly-15k", name=None, split="train"),
+    "wikitext": dict(path="Salesforce/wikitext", name="wikitext-103-raw-v1", split="train[:1%]"),
+}
 
-def build_prompt(example, text_field=None, join_output=False):
-    """
-    Build a simple Alpaca-style prompt from typical instruction-tuning fields.
-    Set join_output=True if you want to append the output text to the prompt (usually keep False).
-    """
-    # If user specifies a text_field, just use that field directly when present.
-    if text_field and text_field in example and isinstance(example[text_field], str) and example[text_field].strip():
-        base = example[text_field].strip()
-        return base
 
-    inst = example.get("instruction", "") or example.get("prompt", "")
-    ipt  = example.get("input", "")
-    out  = example.get("output", "") or example.get("response", "")
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    if inst and ipt:
-        prompt = f"### Instruction:\n{inst}\n\n### Input:\n{ipt}\n\n### Response:\n"
-    elif inst:
-        prompt = f"### Instruction:\n{inst}\n\n### Response:\n"
-    else:
-        # Fall back to any text-like field
-        for key in ["text", "question", "query", "source"]:
-            if key in example and isinstance(example[key], str) and example[key].strip():
-                prompt = example[key].strip()
+
+def example_to_text(name, ex):
+    """Plain-text view of one example for each supported corpus."""
+    if name == "dolly":
+        parts = [ex.get("instruction", ""), ex.get("context", ""), ex.get("response", "")]
+        return "\n".join(p.strip() for p in parts if p and p.strip())
+    return ex["text"].strip()
+
+
+def load_texts(name, tokenizer, sample_size, min_length):
+    """First `sample_size` examples of the corpus with at least `min_length` tokens."""
+    cfg = DATASETS[name]
+    ds = load_dataset(cfg["path"], cfg["name"], split=cfg["split"]) if cfg["name"] \
+        else load_dataset(cfg["path"], split=cfg["split"])
+    texts = []
+    for ex in ds:
+        t = example_to_text(name, ex)
+        if t and len(tokenizer(t).input_ids) >= min_length:
+            texts.append(t)
+            if len(texts) >= sample_size:
                 break
-        else:
-            prompt = "### Instruction:\nDescribe the topic.\n\n### Response:\n"
-
-    if join_output and out:
-        prompt = prompt + out.strip()
-
-    return prompt
+    return texts
 
 
-@torch.no_grad()
-def last_token_entropy_for_prefix_batch(model, input_ids, attention_mask):
-    """
-    Compute next-token entropy at the last token position for each sequence in batch.
-    input_ids, attention_mask: already truncated to the desired prefix length.
-    Return: list of entropies (float) per example.
-    """
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-    logits = outputs.logits  # [B, T, V]
-    B, T, V = logits.shape
-
-    # Last non-padding index per sequence
-    last_idx = attention_mask.sum(dim=1) - 1  # [B]
-    ents = []
-    for i in range(B):
-        idx = int(last_idx[i].item())
-        # entropy on distribution of next token from position idx
-        p = F.softmax(logits[i, idx], dim=-1)
-        ent = float(-(p * (p.clamp_min(1e-12)).log()).sum().item())
-        ent = ent/math.log(V)
-
-        ents.append(ent)
-    return ents
-
-
-@torch.no_grad()
-def embeddings_for_prefix_batch(model, input_ids, attention_mask):
-    """
-    Return mean-pooled last-layer hidden state per example.
-    Shape: [B, H]
-    """
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
-        use_cache=False
-    )
-    last_h = outputs.hidden_states[-1]  # [B, T, H]
-    mask = attention_mask.unsqueeze(-1)  # [B, T, 1]
-    summed = (last_h * mask).sum(dim=1)
-    denom = mask.sum(dim=1).clamp_min(1)
-    pooled = summed / denom
-    return pooled.detach().float().cpu().numpy()
-
-
-def make_prefix_slices(input_ids, attention_mask, prefix_len):
-    """
-    Slice to first prefix_len tokens, but ensure >=1 token.
-    """
-    prefix_len = max(1, min(prefix_len, input_ids.shape[1]))
-    return input_ids[:, :prefix_len], attention_mask[:, :prefix_len]
-
-
-def compute_for_window(model, tokenizer, texts, batch_size, prefix_len, max_length):
-    """
-    For a given prefix length, compute:
-      - mean next-token entropy across samples
-      - silhouette score over pooled embeddings (KMeans k=min(8, n_samples))
-    """
-    all_ents = []
-    all_embs = []
-
-    for start in range(0, len(texts), batch_size):
-        batch_texts = texts[start:start + batch_size]
-        enc = tokenizer(
-            batch_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_length
+def load_model(model_id, use_4bit):
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    dtype = torch.bfloat16 if use_bf16 else torch.float16
+    quant_config = None
+    if use_4bit:
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
         )
-        input_ids = enc["input_ids"].to(model.device)
-        attention_mask = enc["attention_mask"].to(model.device)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    tokenizer.padding_side = "right"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        device_map="auto",
+        attn_implementation="eager",
+        trust_remote_code=True,
+        torch_dtype=dtype,
+        quantization_config=quant_config,
+    )
+    model.eval()
+    return model, tokenizer
 
-        ids_p, mask_p = make_prefix_slices(input_ids, attention_mask, prefix_len)
 
-        # entropy
-        ents = last_token_entropy_for_prefix_batch(model, ids_p, mask_p)
-        all_ents.extend(ents)
-
-        # embeddings
-        embs = embeddings_for_prefix_batch(model, ids_p, mask_p)
-        all_embs.append(embs)
-
-    all_embs = np.vstack(all_embs) if len(all_embs) else np.zeros((0, 2), dtype=np.float32)
-    mean_entropy = float(np.mean(all_ents)) if all_ents else float("nan")
-
-    return mean_entropy
-
-# ----------------------------
-# Metric helpers
-# ----------------------------
+# ----------------------------------------------------------------------------
+# Metrics
+# ----------------------------------------------------------------------------
 def participation_ratio(eigvals):
     s = np.clip(eigvals, 0, None)
     out = float((s.sum() ** 2) / (np.square(s).sum() + 1e-12)) if s.sum() > 0 else 0.0
-    out = out/eigvals.shape[-1]
+    return out / eigvals.shape[-1]
 
-    return out
 
 def effective_rank(eigvals):
     s = np.clip(eigvals, 1e-12, None)
     p = s / s.sum()
     h = -(p * np.log(p)).sum()
-    return float(np.exp(h))/eigvals.shape[-1]
+    return float(np.exp(h)) / eigvals.shape[-1]
 
-# ----------------------------
-# Core computation
-# ----------------------------
+
+def spectrum_metrics(H):
+    """PR and ER of the covariance of token representations H [N, d]."""
+    H = H - H.mean(axis=0, keepdims=True)
+    S = svd(H, full_matrices=False, compute_uv=False)
+    eigvals = (S ** 2) / max(H.shape[0] - 1, 1)
+    return participation_ratio(eigvals), effective_rank(eigvals)
+
+
 @torch.no_grad()
-def compute_metrics(model, tokenizer, texts, prefix_len, max_length, batch_size, token_cap=2048):
-    ents, embs, hiddens = [], [], []
+def profile_prefix(model, tokenizer, texts, prefix_len, max_length, batch_size, layers, token_cap):
+    """Entropy and per-layer PR/ER for a single prefix length (one forward pass per batch)."""
+    entropies = []
+    hiddens = None  # layer index -> list of [n_tokens, d] arrays
 
     for start in range(0, len(texts), batch_size):
-        enc = tokenizer(texts[start:start+batch_size],
-                        return_tensors="pt", padding=True, truncation=True,
-                        max_length=max_length)
-        ids = enc["input_ids"].to(model.device)
-        attn = enc["attention_mask"].to(model.device)
+        enc = tokenizer(texts[start:start + batch_size], return_tensors="pt",
+                        padding=True, truncation=True, max_length=max_length)
+        ids = enc["input_ids"][:, :prefix_len].to(model.device)
+        attn = enc["attention_mask"][:, :prefix_len].to(model.device)
 
-        # truncate to prefix_len
-        ids, attn = ids[:, :prefix_len], attn[:, :prefix_len]
+        out = model(input_ids=ids, attention_mask=attn, output_hidden_states=True, use_cache=False)
 
-        out = model(input_ids=ids, attention_mask=attn,
-                    output_hidden_states=True, use_cache=False)
+        # Next-token entropy at the last non-padding position, normalised by log|V|.
+        logits = out.logits.float()
+        V = logits.shape[-1]
+        last_idx = attn.sum(dim=1) - 1
+        for i in range(logits.shape[0]):
+            p = F.softmax(logits[i, int(last_idx[i])], dim=-1)
+            entropies.append(float(-(p * p.clamp_min(1e-12).log()).sum()) / math.log(V))
 
-        # Embeddings (mean pooled)
-        last_h = out.hidden_states[-1]
-        mask = attn.unsqueeze(-1)
-        pooled = (last_h * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
-        embs.append(pooled.detach().cpu().float().numpy())
+        # Token representations (padding positions excluded).
+        n_layers = len(out.hidden_states) - 1
+        layer_ids = [n_layers] if layers == "last" else list(range(1, n_layers + 1))
+        if hiddens is None:
+            hiddens = {l: [] for l in layer_ids}
+        keep = attn.bool().reshape(-1).cpu().numpy()
+        for l in layer_ids:
+            h = out.hidden_states[l].float().cpu().numpy().reshape(-1, out.hidden_states[l].shape[-1])
+            hiddens[l].append(h[keep])
 
-        # Hidden states for compression/redundancy (just last layer pooled tokens)
-        h = last_h.detach().cpu().float().numpy().reshape(-1, last_h.shape[-1])
-        if h.shape[0] > token_cap:
-            idx = np.random.choice(h.shape[0], size=token_cap, replace=False)
-            h = h[idx]
-        hiddens.append(h)
-
-    # Compression + redundancy (using hidden states from last layer only)
-    H = np.concatenate(hiddens, axis=0)
-    H = H - H.mean(axis=0, keepdims=True)
-
-    U, S, Vt = svd(H, full_matrices=False)
-    eigvals = (S ** 2) / max(H.shape[0] - 1, 1)
-    pr = participation_ratio(eigvals)
-    er = effective_rank(eigvals)
-
-    C = np.cov(H, rowvar=False)
-
-    return pr, er
-
-def load_model(model_id, use_4bit, device):
-    quant_config = None
-    if use_4bit:
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-
-    # Load tokenizer & model
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map="auto", attn_implementation="eager", trust_remote_code=True,
-        torch_dtype=(torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16),
-        quantization_config=quant_config,
-    )
-    model.eval()
-
-    return model, tokenizer
-
-if __name__ == '__main__':
-
-	parser = argparse.ArgumentParser()
-	parser.add_argument("--models", type=str, nargs="+", required=False, \
-                    default=["Qwen/Qwen2.5-7B-Instruct", \
-                             ],
-                    help="List of HF model ids (e.g., meta-llama/Meta-Llama-3-8B-Instruct mistralai/Mistral-7B-Instruct-v0.3 Qwen/Qwen2.5-7B-Instruct)")
-	parser.add_argument("--dataset", type=str, default="wikitext", help="HF dataset id (e.g., wikitext)")
-	parser.add_argument("--dataset_config", type=str, default="wikitext-103-v1", help="HF dataset config or None")
-	parser.add_argument("--split", type=str, default="train")
-	parser.add_argument("--text_field", type=str, default="text", help="Field name to read text from")
-	parser.add_argument("--sample_size", type=int, default=5000)
-	parser.add_argument("--min_length", type=int, default=128, help="Minimum tokenized length to keep")
-	parser.add_argument("--max_length", type=int, default=1024, help="Tokenizer max_length truncation")
-	parser.add_argument("--batch_size", type=int, default=1)
-	parser.add_argument("--window_size", type=int, default=10, help="Prefix window step")
-	parser.add_argument("--max_prefix_tokens", type=int, default=150, help="Max prefix to evaluate (inclusive)")
-	parser.add_argument("--repr_on_every_window", action="store_true",
-	                    help="Compute compression/redundancy on EVERY window (expensive). If not set, only on largest window.")
-	parser.add_argument("--per_layer_token_cap", type=int, default=4096,
-	                    help="Max token vectors per layer (across all batches) for covariance/SVD")
-	parser.add_argument("--use_4bit", action="store_true", help="Quantized 4-bit load to save VRAM")
-	parser.add_argument("--seed", type=int, default=42)
-	parser.add_argument("--out_csv", type=str, default="multi_model_metrics.csv")
-
-	args, _ = parser.parse_known_args()
-
-	all_texts = {}
-
-	tokenizer = AutoTokenizer.from_pretrained(args.models[0], use_fast=True)
-	if tokenizer.pad_token is None:
-    	tokenizer.pad_token = tokenizer.eos_token
-
-    # Load dataset & sample
-	#ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train[:1%]")
-	ds = load_dataset("tatsu-lab/alpaca", split="train[:5%]")
-
-	min_length = 128
-	def has_min_len(example):
-	    return len(tokenizer(example["text"]).input_ids) >= min_length
-
-	ds = ds.filter(has_min_len)
-
-	if args.sample_size is not None and args.sample_size < len(ds):
-	    ds = ds.select(range(args.sample_size))
-
-	texts = []
-
-	for ex in ds:
-	    #texts.append(build_prompt(ex, text_field=args.text_field, join_output=False))
-	    texts.append(ex['text'].strip())
-
-	# Rolling windows
-	all_texts['alpaca'] = texts
-
-	sample_size = 100
-
-	rows = []
-	results = []
-
-	for name, texts in all_texts.items():
-	  if name == 'alpaca':
-	    for length in [200]:
-	      args.max_prefix_tokens = length
-	      args.window_size = length//10
-
-	      windows = list(range(args.window_size, args.max_prefix_tokens + 1, args.window_size))
-
-	      for m in args.models:
-	          print(f"\n=== {m} ===")
-	          model, tok = load_model(m, args.use_4bit, "cuda" if torch.cuda.is_available() else "cpu")
-
-	          for prefix_len in tqdm(windows):
-	              mean_ent = compute_for_window(
-	                  model=model,
-	                  tokenizer=tok,
-	                  texts=texts[:sample_size],
-	                  batch_size=args.batch_size,
-	                  prefix_len=prefix_len,
-	                  max_length=args.max_length
-	              )
+    per_layer = {}
+    for l, chunks in hiddens.items():
+        H = np.concatenate(chunks, axis=0)
+        if H.shape[0] > token_cap:
+            H = H[np.random.choice(H.shape[0], size=token_cap, replace=False)]
+        per_layer[l] = spectrum_metrics(H)
+    return float(np.mean(entropies)), per_layer
 
 
-	              pr, er = compute_metrics(model, tok, texts[:sample_size],
-	                                                          prefix_len=prefix_len, max_length=args.max_length,
-	                                                          batch_size=args.batch_size)
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--models", nargs="+", default=["Qwen/Qwen2.5-7B-Instruct"],
+                    help="Hugging Face model ids")
+    ap.add_argument("--dataset", choices=sorted(DATASETS), default="alpaca")
+    ap.add_argument("--sample_size", type=int, default=100, help="Number of prompts")
+    ap.add_argument("--min_length", type=int, default=128, help="Keep prompts with at least this many tokens")
+    ap.add_argument("--max_length", type=int, default=1024, help="Tokenizer truncation length")
+    ap.add_argument("--context_lengths", type=int, nargs="+", default=[200],
+                    help="Maximum prefix length; prefixes are evaluated in steps of context_length/10")
+    ap.add_argument("--layers", choices=["last", "all"], default="last")
+    ap.add_argument("--batch_size", type=int, default=1)
+    ap.add_argument("--token_cap", type=int, default=100_000,
+                    help="Maximum number of token vectors used for the covariance")
+    ap.add_argument("--use_4bit", action="store_true", help="Load the model in 4-bit (NF4)")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out_csv", default="results/lpp_metrics.csv")
+    args = ap.parse_args()
 
-	              print (f"Entropy {mean_ent}")
+    set_seed(args.seed)
+    os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
+    rows = []
 
-	              row = {
-	                  "model_id": m,
-	                  "prefix_tokens": prefix_len,
-	                  "dataset": name,
-	                  "context_length": length,
-	                  "mean_next_token_entropy": mean_ent,
-	                  "participation_ratio": pr,
-	                  "effective_rank": er,
-	              }
+    # The prompt set is selected once, with the tokenizer of the first model, so that every
+    # model is profiled on exactly the same texts.
+    filter_tok = AutoTokenizer.from_pretrained(args.models[0], use_fast=True)
+    texts = load_texts(args.dataset, filter_tok, args.sample_size, args.min_length)
 
-	              results.append(row)
+    for model_id in args.models:
+        print(f"\n=== {model_id} ===")
+        model, tok = load_model(model_id, args.use_4bit)
+        for ctx in args.context_lengths:
+            step = max(1, ctx // 10)
+            for prefix_len in tqdm(range(step, ctx + 1, step), desc=f"context {ctx}"):
+                ent, per_layer = profile_prefix(model, tok, texts, prefix_len, args.max_length,
+                                                args.batch_size, args.layers, args.token_cap)
+                for layer, (pr, er) in per_layer.items():
+                    rows.append({
+                        "model_id": model_id,
+                        "dataset": args.dataset,
+                        "sample_size": len(texts),
+                        "context_length": ctx,
+                        "prefix_tokens": prefix_len,
+                        "layer": layer,
+                        "mean_next_token_entropy": ent,
+                        "participation_ratio": pr,
+                        "effective_rank": er,
+                    })
+                pd.DataFrame(rows).to_csv(args.out_csv, index=False)
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-	          del model
-	          torch.cuda.empty_cache()
-
-	      df = pd.DataFrame(results)
+    print(f"Saved {len(rows)} rows to {args.out_csv}")
 
 
-
-	df.to_csv(args.out_csv, index=False)
-
+if __name__ == "__main__":
+    main()

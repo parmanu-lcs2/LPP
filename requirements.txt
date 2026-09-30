@@ -1,6 +1,19 @@
-tiktoken
-triton
-flash-attn
-git+https://github.com/huggingface/transformers
-datasets
-torch
+# Core
+torch>=2.1
+transformers>=4.45
+accelerate>=0.30
+datasets>=2.19
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+tqdm>=4.66
+
+# 4-bit loading (only needed with --use_4bit, e.g. Qwen2.5-32B)
+bitsandbytes>=0.43
+
+# Notebooks
+jupyter
+scikit-learn>=1.3
+anthropic>=0.40         # NB2 judge only
+matplotlib>=3.7
+seaborn>=0.13

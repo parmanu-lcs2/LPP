@@ -1,0 +1,9 @@
+Model,claude_AR_acc
+Llama-8B,0.425
+Llama-3B,0.35
+Mistral-7B,0.75
+Qwen-7B,0.575
+Qwen-14B,0.6
+Qwen-1.5B,0.4
+Qwen-0.5B,0.35
+Qwen-3B,0.525

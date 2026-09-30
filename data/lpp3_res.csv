@@ -1,0 +1,7 @@
+intrinsic,extrinsic,correlation,pvalue
+Min Entropy,SPC,-0.156615345,0.711112791
+Max Rank,SPC,-0.713490309,0.046886846
+Max Participation,SPC,-0.794254077,0.018552133
+Min Entropy,AR,-0.78968505,0.019742688
+Max Rank,AR,-0.239766597,0.567370115
+Max Participation,AR,-0.333533292,0.419456895

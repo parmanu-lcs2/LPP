@@ -1,0 +1,9 @@
+Model,TQA_acc
+Qwen-0.5B,0.31
+Qwen-1.5B,0.355
+Qwen-3B,0.405
+Qwen-7B,0.44
+Qwen-14B,0.46
+Llama-3B,0.345
+Llama-8B,0.405
+Mistral-7B,0.445
