@@ -27,7 +27,7 @@ data/                  # synthetic datasets and source data (see below)
 Python 3.10 or later is required. A CUDA GPU is recommended; all experiments in the paper were run on a single NVIDIA A100.
 
 ```bash
-git clone https://github.com/LCS2-IIITD/LPP.git
+git clone https://github.com/parmanu-lcs2/lpp.git
 cd LPP
 pip install -r requirements.txt
 ```
